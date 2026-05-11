@@ -89,32 +89,102 @@ def summarize_group_shares_and_att(data: pd.DataFrame) -> pd.DataFrame:
     """
     Return one row per treated cohort and one row for all treated observations.
     """
-    raise NotImplementedError("Implement summarize_group_shares_and_att().")
+    unit_cohort = data.drop_duplicates(subset=["id"])[["id", "cohort"]]
+    n_units = unit_cohort.shape[0]
+    n_rows = data.shape[0]
+
+    treated_cohorts = sorted(int(g) for g in unit_cohort["cohort"].unique() if g > 0)
+
+    rows = []
+    for g in treated_cohorts:
+        fraction = float((unit_cohort["cohort"] == g).sum()) / float(n_units)
+        treated_mask = (data["cohort"] == g) & (data["d"] == 1)
+        att = float(data.loc[treated_mask, "tau_it"].mean()) if treated_mask.any() else float("nan")
+        rows.append({"group": f"cohort_{g}", "fraction": fraction, "att": att})
+
+    all_treated_mask = data["d"] == 1
+    fraction_all = float(all_treated_mask.sum()) / float(n_rows)
+    att_all = float(data.loc[all_treated_mask, "tau_it"].mean()) if all_treated_mask.any() else float("nan")
+    rows.append({"group": "all_treated", "fraction": fraction_all, "att": att_all})
+
+    return pd.DataFrame(rows, columns=["group", "fraction", "att"])
 
 
 def estimate_cohort_did(data: pd.DataFrame, cohort: int, event_time: int, control_group: str) -> float:
     """
     Return a two-period DID estimate for one treatment cohort and event time.
     """
-    raise NotImplementedError("Implement estimate_cohort_did().")
+    target_period = cohort + event_time
+    baseline_period = cohort - 1
+
+    treated = data[data["cohort"] == cohort]
+    y_treated_t = treated.loc[treated["time"] == target_period, "y"].mean()
+    y_treated_b = treated.loc[treated["time"] == baseline_period, "y"].mean()
+
+    if control_group == "never":
+        control = data[data["cohort"] == 0]
+    elif control_group == "notyet":
+        control = data[(data["cohort"] == 0) | (data["cohort"] > target_period)]
+    else:
+        raise ValueError(f"Unknown control_group: {control_group}")
+
+    y_ctrl_t = control.loc[control["time"] == target_period, "y"].mean()
+    y_ctrl_b = control.loc[control["time"] == baseline_period, "y"].mean()
+
+    return float((y_treated_t - y_treated_b) - (y_ctrl_t - y_ctrl_b))
 
 
 def estimate_event_study(data: pd.DataFrame, event_times: list[int], control_group: str) -> pd.DataFrame:
     """
     Return cohort-event DID estimates.
     """
-    raise NotImplementedError("Implement estimate_event_study().")
+    treated_cohorts = sorted(int(g) for g in data["cohort"].unique() if g > 0)
+    min_time = int(data["time"].min())
+    max_time = int(data["time"].max())
+
+    rows = []
+    for g in treated_cohorts:
+        baseline = g - 1
+        if baseline < min_time or baseline > max_time:
+            continue
+        for e in event_times:
+            target = g + int(e)
+            if target < min_time or target > max_time:
+                continue
+            estimate = estimate_cohort_did(data, cohort=g, event_time=int(e), control_group=control_group)
+            rows.append({"cohort": g, "event_time": int(e), "estimate": estimate})
+
+    result = pd.DataFrame(rows, columns=["cohort", "event_time", "estimate"])
+    if not result.empty:
+        result = result.sort_values(["cohort", "event_time"]).reset_index(drop=True)
+    return result
 
 
 def aggregate_post_treatment_effects(event_study: pd.DataFrame) -> float:
     """
     Return the average estimate over post-treatment event times.
     """
-    raise NotImplementedError("Implement aggregate_post_treatment_effects().")
+    post = event_study[event_study["event_time"] >= 0]
+    return float(post["estimate"].mean())
 
 
 def estimate_twfe_coefficient(data: pd.DataFrame) -> float:
     """
     Return the coefficient from a residualized two-way fixed effects regression of y on d.
     """
-    raise NotImplementedError("Implement estimate_twfe_coefficient().")
+    y = data["y"].astype(float)
+    d = data["d"].astype(float)
+
+    y_unit = data.groupby("id")["y"].transform("mean")
+    y_time = data.groupby("time")["y"].transform("mean")
+    y_grand = y.mean()
+    y_ddot = y - y_unit - y_time + y_grand
+
+    d_unit = data.groupby("id")["d"].transform("mean")
+    d_time = data.groupby("time")["d"].transform("mean")
+    d_grand = d.mean()
+    d_ddot = d - d_unit - d_time + d_grand
+
+    numerator = float((d_ddot * y_ddot).sum())
+    denominator = float((d_ddot * d_ddot).sum())
+    return numerator / denominator
